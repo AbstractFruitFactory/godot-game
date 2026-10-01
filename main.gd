@@ -4,10 +4,12 @@ extends Node3D
 
 const PORT := 7777
 const ROOM_SIZE := 20.0
-const WALL_COLOR := Color(0.35, 0.33, 0.32)
+const TORCH_ENERGY := 4.0
+const MODELS := "res://assets/kaykit/dungeon/models/"
 const PlayerScript := preload("res://player.gd")
 
 var _players := Node3D.new()
+var _next_character := 0
 var _spawner := MultiplayerSpawner.new()
 var _torches: Array[OmniLight3D] = []
 var _menu := CanvasLayer.new()
@@ -30,7 +32,7 @@ func _ready() -> void:
 func _process(_delta: float) -> void:
 	var t := Time.get_ticks_msec() / 1000.0
 	for i in _torches.size():
-		_torches[i].light_energy = 5.0 + sin(t * 9.0 + i) * 0.15 + sin(t * 23.0 + i * 2.0) * 0.1
+		_torches[i].light_energy = TORCH_ENERGY + sin(t * 9.0 + i) * 0.15 + sin(t * 23.0 + i * 2.0) * 0.1
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -65,7 +67,8 @@ func join(ip: String) -> void:
 
 
 func _add_player(id: int) -> void:
-	_spawner.spawn(id)
+	_spawner.spawn({"id": id, "character": _next_character})
+	_next_character += 1
 
 
 func _remove_player(id: int) -> void:
@@ -74,10 +77,11 @@ func _remove_player(id: int) -> void:
 		player.queue_free()
 
 
-func _create_player(id: int) -> Node:
+func _create_player(data: Dictionary) -> Node:
 	var player: CharacterBody3D = PlayerScript.new()
-	player.name = str(id)
-	player.position = Vector3(_players.get_child_count() * 1.5 - 1.5, 1, 4)
+	player.name = str(data.id)
+	player.character = PlayerScript.CHARACTERS.keys()[data.character % PlayerScript.CHARACTERS.size()]
+	player.position = Vector3(data.character * 1.5 - 1.5, 1, 4)
 	return player
 
 
@@ -155,44 +159,67 @@ func _build_environment() -> void:
 
 func _build_room() -> void:
 	var h := ROOM_SIZE / 2
-	_add_box(Vector3(ROOM_SIZE, 0.5, ROOM_SIZE), Vector3(0, -0.25, 0), Color(0.3, 0.28, 0.26))
-	_add_box(Vector3(ROOM_SIZE, 3, 1), Vector3(0, 1.5, -h), WALL_COLOR)
-	_add_box(Vector3(1, 3, ROOM_SIZE), Vector3(-h, 1.5, 0), WALL_COLOR)
-	_add_box(Vector3(1, 3, ROOM_SIZE), Vector3(h, 1.5, 0), WALL_COLOR)
-	# South wall stays low so the camera can see into the room.
-	_add_box(Vector3(ROOM_SIZE, 0.6, 1), Vector3(0, 0.3, h), WALL_COLOR)
+	for x in range(-8, 9, 4):
+		for z in range(-8, 9, 4):
+			_place("floor_tile_large", Vector3(x, 0, z))
+		_place("wall_doorway" if x == 0 else "wall", Vector3(x, 0, -h))
+	for z in range(-8, 9, 4):
+		_place("wall", Vector3(-h, 0, z), PI / 2)
+		_place("wall", Vector3(h, 0, z), PI / 2)
+	_place("pillar", Vector3(-h, 0, -h))
+	_place("pillar", Vector3(h, 0, -h))
+
+	# Walls and floor collide via plain boxes. The south side has no visible wall so the camera can see in.
+	_add_collider(Vector3(ROOM_SIZE, 0.5, ROOM_SIZE), Vector3(0, -0.25, 0))
+	_add_collider(Vector3(ROOM_SIZE, 4, 1), Vector3(0, 2, -h))
+	_add_collider(Vector3(ROOM_SIZE, 4, 1), Vector3(0, 2, h))
+	_add_collider(Vector3(1, 4, ROOM_SIZE), Vector3(-h, 2, 0))
+	_add_collider(Vector3(1, 4, ROOM_SIZE), Vector3(h, 2, 0))
+
 	for x in [-5.0, 5.0]:
 		for z in [-4.0, 4.0]:
-			_add_box(Vector3(1, 3, 1), Vector3(x, 1.5, z), WALL_COLOR)
-	for pos in [Vector3(-6, 2, -h + 0.7), Vector3(6, 2, -h + 0.7), Vector3(-h + 0.7, 2, 0), Vector3(h - 0.7, 2, 0)]:
-		_add_torch(pos)
-	_add_torch(Vector3(0, 1.2, 0))  # brazier in the middle
+			_place("pillar", Vector3(x, 0, z))
+			_add_collider(Vector3(1.5, 4, 1.5), Vector3(x, 2, z))
+	for prop: Array in [["barrel_large", Vector3(-8, 0, -8)], ["crates_stacked", Vector3(8, 0, -8)],
+			["chest", Vector3(-8, 0, 7)], ["barrel_small_stack", Vector3(8, 0, 7)]]:
+		_place(prop[0], prop[1])
+		_add_collider(Vector3(1.8, 2, 1.8), prop[1] + Vector3(0, 1, 0))
+
+	for x in [-4.0, 4.0]:
+		_add_torch(Vector3(x, 2, -h + 0.5), 0.0)
+	for z in [-4.0, 4.0]:
+		_add_torch(Vector3(-h + 0.5, 2, z), PI / 2)
+		_add_torch(Vector3(h - 0.5, 2, z), -PI / 2)
 
 
-func _add_box(size: Vector3, pos: Vector3, color: Color) -> void:
-	var body := StaticBody3D.new()
-	body.position = pos
-	var mesh := BoxMesh.new()
-	mesh.size = size
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mat.roughness = 0.9
-	var inst := MeshInstance3D.new()
-	inst.mesh = mesh
-	inst.material_override = mat
+func _place(model: String, pos: Vector3, rot_y := 0.0) -> void:
+	var path := MODELS + model + ".gltf.glb"
+	if not ResourceLoader.exists(path):
+		path = MODELS + model + ".glb"
+	var node: Node3D = load(path).instantiate()
+	node.position = pos
+	node.rotation.y = rot_y
+	add_child(node)
+
+
+func _add_collider(size: Vector3, pos: Vector3) -> void:
 	var shape := BoxShape3D.new()
 	shape.size = size
 	var col := CollisionShape3D.new()
 	col.shape = shape
-	body.add_child(inst)
+	var body := StaticBody3D.new()
+	body.position = pos
 	body.add_child(col)
 	add_child(body)
 
 
-func _add_torch(pos: Vector3) -> void:
+## Wall torch at `pos` (on the wall's inner face), facing into the room along `rot_y`.
+func _add_torch(pos: Vector3, rot_y: float) -> void:
+	_place("torch_mounted", pos, rot_y)
+	var flame_pos := pos + Basis(Vector3.UP, rot_y) * Vector3(0, 0.55, 0.35)
 	var mesh := SphereMesh.new()
-	mesh.radius = 0.12
-	mesh.height = 0.24
+	mesh.radius = 0.1
+	mesh.height = 0.2
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(1, 0.6, 0.2)
 	mat.emission_enabled = true
@@ -202,13 +229,13 @@ func _add_torch(pos: Vector3) -> void:
 	flame.mesh = mesh
 	flame.material_override = mat
 	flame.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	flame.position = pos
+	flame.position = flame_pos
 	add_child(flame)
 
 	var light := OmniLight3D.new()
-	light.position = pos
+	light.position = flame_pos + Basis(Vector3.UP, rot_y) * Vector3(0, 0, 0.2)
 	light.light_color = Color(1, 0.6, 0.3)
-	light.omni_range = 14.0
+	light.omni_range = 12.0
 	light.shadow_enabled = true
 	add_child(light)
 	_torches.append(light)

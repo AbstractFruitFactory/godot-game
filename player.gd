@@ -1,35 +1,33 @@
 extends CharacterBody3D
 ## Co-op player. The owning peer moves it (WASD, face mouse, click/Space to attack);
 ## a MultiplayerSynchronizer copies position and rotation to everyone else.
+## Animations are derived locally from movement, so they need no extra syncing.
+
+const CHARACTERS := {
+	"Knight": ["1H_Sword", "Round_Shield"],
+	"Barbarian": ["1H_Axe", "Barbarian_Round_Shield"],
+	"Rogue": ["Knife", "Knife_Offhand"],
+	"Mage": ["1H_Wand", "Spellbook"],
+}
+const ATTACK_ANIM := "1H_Melee_Attack_Slice_Horizontal"
 
 @export var speed := 6.0
 @export var camera_offset := Vector3(0, 12, 7)
 
-var _sword_pivot := Node3D.new()
+var character := "Knight"  # set by the spawner before the player enters the tree
 var _camera: Camera3D
-var _swinging := false
+var _anim: AnimationPlayer
+var _attacking := false
+var _last_position := Vector3.ZERO
 
 
 func _init() -> void:
+	var shape := CapsuleShape3D.new()
+	shape.radius = 0.5
+	shape.height = 2.0
 	var col := CollisionShape3D.new()
-	col.shape = CapsuleShape3D.new()
+	col.shape = shape
 	add_child(col)
-	var mat := StandardMaterial3D.new()
-	var body := MeshInstance3D.new()
-	body.name = "Body"
-	body.mesh = CapsuleMesh.new()
-	body.material_override = mat
-	add_child(body)
-
-	var blade_mesh := BoxMesh.new()
-	blade_mesh.size = Vector3(0.1, 0.1, 1.2)
-	var blade := MeshInstance3D.new()
-	blade.mesh = blade_mesh
-	blade.position = Vector3(0, 0, -0.9)
-	_sword_pivot.position.y = 0.2
-	_sword_pivot.rotation.y = deg_to_rad(60)
-	_sword_pivot.add_child(blade)
-	add_child(_sword_pivot)
 
 	var config := SceneReplicationConfig.new()
 	config.add_property(".:position")
@@ -43,11 +41,25 @@ func _init() -> void:
 # Authority must be set here (not in _ready) so the synchronizer is owned correctly at spawn.
 func _enter_tree() -> void:
 	set_multiplayer_authority(name.to_int())
-	var mat: StandardMaterial3D = $Body.material_override
-	mat.albedo_color = Color.from_hsv(fmod(name.to_int() * 0.618, 1.0), 0.5, 0.9)
 
 
 func _ready() -> void:
+	var model: Node3D = load("res://assets/kaykit/adventurers/characters/%s.glb" % character).instantiate()
+	model.position.y = -1.0  # capsule is centered; model origin is at its feet
+	model.rotation.y = PI  # KayKit models face +Z, Godot's forward is -Z
+	add_child(model)
+	var gear: Array = CHARACTERS[character]
+	for slot in ["handslot_r", "handslot_l"]:
+		for item: Node3D in model.find_child(slot, true, false).get_children():
+			item.visible = item.name in gear
+
+	_anim = model.find_child("AnimationPlayer", true, false)
+	for loop_anim in ["Idle", "Running_A"]:
+		_anim.get_animation(loop_anim).loop_mode = Animation.LOOP_LINEAR
+	_anim.animation_finished.connect(func(_name: StringName) -> void: _attacking = false)
+	_anim.play("Idle")
+	_last_position = position
+
 	if is_multiplayer_authority():
 		_camera = Camera3D.new()
 		_camera.top_level = true
@@ -61,6 +73,11 @@ func _process(delta: float) -> void:
 	if _camera:
 		var target := global_position + camera_offset
 		_camera.global_position = _camera.global_position.lerp(target, 1.0 - exp(-8.0 * delta))
+
+	var moved := Vector2(position.x - _last_position.x, position.z - _last_position.z).length()
+	_last_position = position
+	if not _attacking and delta > 0.0:
+		_anim.play("Running_A" if moved / delta > 0.5 else "Idle", 0.15)
 
 
 func _physics_process(delta: float) -> void:
@@ -91,10 +108,7 @@ func _face_mouse() -> void:
 
 @rpc("authority", "call_local", "reliable")
 func attack() -> void:
-	if _swinging:
+	if _attacking:
 		return
-	_swinging = true
-	var tween := create_tween()
-	tween.tween_property(_sword_pivot, "rotation:y", deg_to_rad(-80), 0.12).set_ease(Tween.EASE_OUT)
-	tween.tween_property(_sword_pivot, "rotation:y", deg_to_rad(60), 0.25)
-	tween.tween_callback(func() -> void: _swinging = false)
+	_attacking = true
+	_anim.play(ATTACK_ANIM, 0.1)
